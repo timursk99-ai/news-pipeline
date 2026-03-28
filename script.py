@@ -4,11 +4,12 @@ script.py
 
 - Reads tickers from tickers.txt (one ticker per line)
 - Fetches Seeking Alpha RSS for each ticker
-- Calls Google Gemini (Generative Language REST API) for summary + sentiment
+- Calls Google Gemini (gemini-2.5-flash) via REST generateContent for summary + sentiment
 - Writes one CSV per ticker: news_{TICKER}.csv
 - Sentiment Score is normalized to 0-100
 - Skips duplicate URLs already present in each ticker CSV
 - Deterministic generation parameters, retries, and robust parsing
+- IMPORTANT: store your Gemini API key as the repository secret GEMINI_API_KEY (do NOT hardcode it)
 """
 
 import os
@@ -37,7 +38,7 @@ MAX_ARTICLES_PER_TICKER = 10
 
 # Gemini / Google Generative Language
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_MODEL = "gemini-1.5-flash"  # change if you prefer another available model
+GEMINI_MODEL = "gemini-2.5-flash"  # using the model you specified
 GEMINI_ENDPOINT_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
 GEMINI_RETRIES = 3
 GEMINI_BACKOFF_BASE = 1.5  # seconds
@@ -80,13 +81,18 @@ def fetch_feed_for_ticker(ticker: str) -> List[Any]:
 # Gemini call + parsing
 # -------------------------
 def call_gemini(prompt: str, max_output_tokens: int = 200) -> Tuple[bool, str]:
-    """Call Gemini generateContent REST endpoint with retries. Returns (ok, text)."""
+    """
+    Call Gemini generateContent REST endpoint with retries.
+    Uses the same request shape as your working curl example (contents -> parts -> text).
+    Returns (ok, text) where text is the model's returned string (or JSON string).
+    """
     if not GEMINI_API_KEY:
         return False, "no_api_key"
     endpoint = GEMINI_ENDPOINT_TEMPLATE.format(model=GEMINI_MODEL, key=GEMINI_API_KEY)
     headers = {"Content-Type": "application/json"}
+    # Use deterministic parameters (temperature 0.0) to reduce variance
     body = {
-        "content": [{"parts": [{"text": prompt}]}],
+        "contents": [{"parts": [{"text": prompt}]}],
         "temperature": 0.0,
         "maxOutputTokens": max_output_tokens
     }
@@ -98,8 +104,9 @@ def call_gemini(prompt: str, max_output_tokens: int = 200) -> Tuple[bool, str]:
                     j = r.json()
                 except Exception:
                     return False, r.text[:2000]
-                # Typical response: {"candidates":[{"content":{"parts":[{"text":"..."}]}}], ...}
+                # Typical response shape: {"candidates":[{"content":{"parts":[{"text":"..."}]}}], ...}
                 try:
+                    # Try top-level 'candidates'
                     cands = j.get("candidates") or j.get("candidates", [])
                     if isinstance(cands, list) and cands:
                         first = cands[0]
@@ -108,17 +115,18 @@ def call_gemini(prompt: str, max_output_tokens: int = 200) -> Tuple[bool, str]:
                         if isinstance(parts, list) and parts:
                             text = parts[0].get("text") or ""
                             return True, text
-                    # fallback: output.candidates
+                    # Some responses use 'output' wrapper
                     out = j.get("output") or {}
                     ocands = out.get("candidates") or []
                     if ocands and isinstance(ocands[0], dict):
                         parts = ocands[0].get("content", {}).get("parts", [])
                         if parts:
                             return True, parts[0].get("text", "")
-                    # fallback to stringified JSON
+                    # Fallback: stringify JSON
                     return True, json.dumps(j)
                 except Exception:
                     return False, json.dumps(j)[:2000]
+            # transient errors: backoff and retry
             if r.status_code in (429, 500, 502, 503, 504):
                 wait = GEMINI_BACKOFF_BASE ** attempt
                 logger.warning(f"Gemini returned {r.status_code}. Backing off {wait:.1f}s (attempt {attempt})")
@@ -132,7 +140,10 @@ def call_gemini(prompt: str, max_output_tokens: int = 200) -> Tuple[bool, str]:
     return False, "max_retries"
 
 def _extract_json_or_heuristics(text: str) -> Dict[str, Any]:
-    """Return dict parsed from JSON in text or heuristics for summary/label/score."""
+    """
+    Extract JSON object from text if present, otherwise use regex heuristics to find summary/label/score.
+    Accepts numeric formats 0-1, 0-100, -1..1 and normalizes later.
+    """
     # 1) direct JSON
     try:
         parsed = json.loads(text)
@@ -179,7 +190,10 @@ def _extract_json_or_heuristics(text: str) -> Dict[str, Any]:
     return result
 
 def ask_gemini_for_summary_and_sentiment(text: str) -> Tuple[str, str, float]:
-    """Prompt Gemini to return strict JSON. Parse and normalize score to 0-100."""
+    """
+    Prompt Gemini to return strict JSON and parse/normalize the result.
+    Returns (summary, sentiment_label, sentiment_score_0_100).
+    """
     prompt = (
         "You are a concise financial assistant. Respond with a single valid JSON object and nothing else. "
         "The JSON must contain exactly these keys: \"summary\", \"sentiment_label\", \"sentiment_score\". "
@@ -214,6 +228,7 @@ def ask_gemini_for_summary_and_sentiment(text: str) -> Tuple[str, str, float]:
     except Exception:
         score_val = None
 
+    # Fallback heuristics if no numeric score
     if score_val is None:
         if label == "positive":
             score_val = 75.0
@@ -222,6 +237,7 @@ def ask_gemini_for_summary_and_sentiment(text: str) -> Tuple[str, str, float]:
         else:
             score_val = 50.0
 
+    # Normalize label if missing or unexpected
     if label not in ("positive", "neutral", "negative"):
         if score_val >= 66:
             label = "positive"
