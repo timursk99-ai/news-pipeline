@@ -4,7 +4,7 @@ script.py
 
 - Reads tickers from tickers.txt (one ticker per line)
 - Fetches Seeking Alpha RSS for each ticker
-- Calls Hugging Face inference for summary and sentiment when HF_API_KEY is set
+- Calls MiniMax-M2.5 via Hugging Face Inference API for summary + sentiment
 - Writes one CSV per ticker: news_{TICKER}.csv
 - Sentiment Score is scaled 0-100
 - Skips duplicate URLs already present in each ticker CSV
@@ -13,6 +13,7 @@ script.py
 
 import os
 import time
+import json
 import logging
 from datetime import datetime
 from typing import Tuple, List, Dict, Any
@@ -33,11 +34,11 @@ REQUEST_TIMEOUT = 20
 PER_TICKER_SLEEP = 1.0
 MAX_ARTICLES_PER_TICKER = 10
 
-# Hugging Face configuration
+# Hugging Face / MiniMax
 HF_API_KEY = os.environ.get("HF_API_KEY")
 HF_HEADERS = {"Authorization": f"Bearer {HF_API_KEY}"} if HF_API_KEY else {}
-HF_SUMMARIZER = "https://api-inference.huggingface.co/models/MiniMaxAI/MiniMax-M2.5"
-HF_SENTIMENT = "https://api-inference.huggingface.co/models/MiniMaxAI/MiniMax-M2.5"
+# MiniMax text generation endpoint (model repo id)
+HF_MINIMAX = "https://api-inference.huggingface.co/models/MiniMaxAI/MiniMax-M2.5"
 HF_RETRIES = 3
 HF_BACKOFF_BASE = 1.5  # seconds
 
@@ -75,74 +76,122 @@ def fetch_feed_for_ticker(ticker: str) -> List[Any]:
         logger.exception(f"{ticker}: error fetching feed: {e}")
         return []
 
-def call_hf(endpoint: str, payload: dict) -> Tuple[bool, Any]:
-    """Call Hugging Face inference endpoint with retries and backoff."""
+def call_minimax(prompt: str) -> Tuple[bool, str]:
+    """Call MiniMax model endpoint with retries. Returns (ok, text)."""
     if not HF_API_KEY:
-        return False, {"error": "no_api_key"}
+        return False, "no_api_key"
+    payload = {"inputs": prompt, "options": {"wait_for_model": True}}
     for attempt in range(1, HF_RETRIES + 1):
         try:
-            r = requests.post(endpoint, headers=HF_HEADERS, json=payload, timeout=30)
+            r = requests.post(HF_MINIMAX, headers=HF_HEADERS, json=payload, timeout=60)
             if r.status_code == 200:
                 try:
-                    return True, r.json()
+                    # Many generation endpoints return JSON with 'generated_text' or a list
+                    j = r.json()
+                    # Try common shapes
+                    if isinstance(j, dict) and "generated_text" in j:
+                        return True, j["generated_text"]
+                    if isinstance(j, list) and j and isinstance(j[0], dict) and "generated_text" in j[0]:
+                        return True, j[0]["generated_text"]
+                    # Otherwise return raw text if present
+                    if isinstance(j, str):
+                        return True, j
+                    return True, json.dumps(j)[:2000]
                 except Exception:
-                    return False, {"error": "invalid_json", "text": r.text[:500]}
+                    return False, r.text[:2000]
             if r.status_code in (429, 500, 502, 503, 504):
                 wait = HF_BACKOFF_BASE ** attempt
-                logger.warning(f"HF {endpoint} returned {r.status_code}. Backing off {wait:.1f}s (attempt {attempt})")
+                logger.warning(f"MiniMax returned {r.status_code}. Backing off {wait:.1f}s (attempt {attempt})")
                 time.sleep(wait)
                 continue
-            return False, {"error": "status", "status_code": r.status_code, "text": r.text[:500]}
+            return False, f"status:{r.status_code} text:{r.text[:500]}"
         except requests.RequestException as e:
             wait = HF_BACKOFF_BASE ** attempt
-            logger.warning(f"HF request exception {e}. Backing off {wait:.1f}s (attempt {attempt})")
+            logger.warning(f"MiniMax request exception {e}. Backing off {wait:.1f}s (attempt {attempt})")
             time.sleep(wait)
-    return False, {"error": "max_retries"}
+    return False, "max_retries"
 
-def summarize_text(text: str) -> str:
-    if not text:
-        return ""
-    ok, out = call_hf(HF_SUMMARIZER, {"inputs": text[:2000]})
-    if not ok:
-        logger.debug(f"Summarizer failed: {out}")
-        return text[:200]  # fallback
-    if isinstance(out, list) and out and isinstance(out[0], dict):
-        return out[0].get("summary_text", "") or text[:200]
-    if isinstance(out, dict) and "summary_text" in out:
-        return out.get("summary_text", "") or text[:200]
-    return str(out)[:200]
-
-def sentiment_text(text: str) -> Tuple[str, float]:
-    """Return (label, score_0_100). Score scaled to 0-100."""
-    if not text:
-        return "", 0.0
-    ok, out = call_hf(HF_SENTIMENT, {"inputs": text[:2000]})
-    if not ok:
-        logger.debug(f"Sentiment failed: {out}")
-        return "", 0.0
-    # peejm/finbert-financial-sentiment returns a list of dicts like [{"label":"positive","score":0.9}, ...]
+def parse_minimax_json(text: str) -> Dict[str, Any]:
+    """Try to extract JSON from model output. Accepts raw JSON or text containing JSON."""
+    # First try direct parse
     try:
-        if isinstance(out, list) and out and isinstance(out[0], dict):
-            label = out[0].get("label", "")
-            score01 = float(out[0].get("score", 0.0))
-            score100 = round(score01 * 100, 2)
-            return label, score100
-        if isinstance(out, dict) and "label" in out:
-            label = out.get("label", "")
-            score01 = float(out.get("score", 0.0))
-            return label, round(score01 * 100, 2)
+        return json.loads(text)
     except Exception:
-        logger.exception("Error parsing HF sentiment response")
-    return "", 0.0
+        pass
+    # Try to find a JSON substring
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        snippet = text[start:end+1]
+        try:
+            return json.loads(snippet)
+        except Exception:
+            pass
+    # fallback empty
+    return {}
+
+def ask_minimax_for_summary_and_sentiment(text: str) -> Tuple[str, str, float]:
+    """Prompt MiniMax to return JSON with summary, sentiment_label, sentiment_score (0-100)."""
+    # Keep prompt short and deterministic
+    prompt = (
+        "You are a concise financial assistant. Given the input text, return a JSON object only, "
+        "with keys: \"summary\", \"sentiment_label\", and \"sentiment_score\". "
+        "\"summary\" should be a short 1-2 sentence summary. "
+        "\"sentiment_label\" should be one of: positive, neutral, negative. "
+        "\"sentiment_score\" should be a number from 0 to 100 representing sentiment strength (100 = most positive). "
+        "Input:\n\n" + text
+    )
+    ok, out = call_minimax(prompt)
+    if not ok:
+        logger.debug(f"MiniMax call failed: {out}")
+        # fallback: short summary and neutral score
+        return (text[:200], "neutral", 50.0)
+    parsed = parse_minimax_json(out)
+    summary = parsed.get("summary") or parsed.get("Summary") or ""
+    label = parsed.get("sentiment_label") or parsed.get("sentiment") or parsed.get("label") or ""
+    score = parsed.get("sentiment_score") or parsed.get("score") or parsed.get("sentiment_score_0_100") or None
+    # Normalize score
+    try:
+        if score is None:
+            # try to infer from label if possible
+            if label and label.lower() == "positive":
+                score_val = 75.0
+            elif label and label.lower() == "negative":
+                score_val = 25.0
+            else:
+                score_val = 50.0
+        else:
+            score_val = float(score)
+            # If model returned 0-1, scale to 0-100
+            if 0.0 <= score_val <= 1.0:
+                score_val = round(score_val * 100.0, 2)
+            else:
+                score_val = round(score_val, 2)
+    except Exception:
+        score_val = 50.0
+    # Ensure label normalized
+    label = (label or "").lower()
+    if label not in ("positive", "neutral", "negative"):
+        # try heuristics
+        if score_val >= 66:
+            label = "positive"
+        elif score_val <= 34:
+            label = "negative"
+        else:
+            label = "neutral"
+    return (summary or text[:200], label, score_val)
 
 def extract_article_row(ticker: str, entry: Any) -> Dict[str, Any]:
     title = getattr(entry, "title", "") or ""
     link = getattr(entry, "link", "") or ""
     published = getattr(entry, "published", "") or getattr(entry, "updated", "") or ""
     raw_text = getattr(entry, "summary", "") or title
-    # Use HF only if API key present; otherwise fallback to raw text
-    summary = summarize_text(raw_text) if HF_API_KEY else (raw_text[:200] if raw_text else "")
-    label, score = sentiment_text(raw_text) if HF_API_KEY else ("", 0.0)
+    # Use MiniMax if API key present; otherwise fallback
+    if HF_API_KEY:
+        summary, label, score = ask_minimax_for_summary_and_sentiment(raw_text)
+    else:
+        summary = raw_text[:200] if raw_text else ""
+        label, score = "", 0.0
     return {
         "Ticker": ticker,
         "Title": title,
