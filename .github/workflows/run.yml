@@ -29,6 +29,8 @@ jobs:
           ls -la
 
       - name: Run script
+        env:
+          HF_API_KEY: ${{ secrets.HF_API_KEY }}
         run: python script.py
 
       - name: Show CSV contents debug
