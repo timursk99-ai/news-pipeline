@@ -43,18 +43,17 @@ jobs:
           set -o pipefail
           python -u script.py
 
-      - name: Show CSV contents (debug)
+      - name: Show CSVs (debug)
         run: |
-          if [ -f news_data.csv ]; then
-            echo "news_data.csv head:"
-            head -n 20 news_data.csv || true
-            echo "lines:"
-            wc -l news_data.csv || true
-          else
-            echo "news_data.csv not found"
-          fi
+          echo "CSV files in workspace:"
+          ls -1 news_*.csv || echo "no news CSVs yet"
+          for f in news_*.csv; do
+            echo "---- $f ----"
+            head -n 10 "$f" || true
+            echo "lines: $(wc -l < "$f" 2>/dev/null || echo 0)"
+          done
 
-      - name: Commit updated CSV (robust)
+      - name: Commit updated CSVs (robust)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BRANCH: ${{ github.ref_name }}
@@ -64,48 +63,44 @@ jobs:
           git config --global user.name "bot"
           git config --global user.email "bot@github.com"
 
-          # Ensure we are on the checked-out branch
           git checkout -q "$BRANCH" || true
 
-          # Use token for authenticated push/pull if available
           if [ -n "${GITHUB_TOKEN:-}" ]; then
             git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
           fi
 
-          # Only proceed if the CSV exists
-          if [ ! -f news_data.csv ]; then
-            echo "news_data.csv not found; skipping commit"
+          # Stage all news CSVs that exist
+          shopt -s nullglob
+          files=(news_*.csv)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No news_*.csv files to commit; exiting"
             exit 0
           fi
 
-          # Stage file
-          git add news_data.csv
+          git add "${files[@]}"
 
-          # If nothing staged, skip
           if git diff --cached --quiet; then
-            echo "news_data.csv exists but no changes to commit"
+            echo "No changes to commit"
             exit 0
           fi
 
-          # Fetch remote and rebase local staged changes on top of remote branch
           git fetch origin "$BRANCH"
 
           if git rev-parse --verify "origin/$BRANCH" >/dev/null 2>&1; then
             echo "Rebasing on top of origin/$BRANCH"
-            git commit -m "update data" || true
+            git commit -m "update news CSVs" || true
             if ! git rebase "origin/$BRANCH"; then
-              echo "Rebase failed — aborting rebase and exiting without push"
+              echo "Rebase failed — aborting and exiting"
               git rebase --abort || true
               exit 1
             fi
           else
-            git commit -m "update data" || true
+            git commit -m "update news CSVs" || true
           fi
 
-          # Push the rebased commit
           if git push origin "HEAD:$BRANCH"; then
             echo "Pushed changes to origin/$BRANCH"
           else
-            echo "Push failed. Attempting safe force-with-lease as last resort"
+            echo "Push failed. Attempting safe force-with-lease"
             git push --force-with-lease origin "HEAD:$BRANCH"
           fi
