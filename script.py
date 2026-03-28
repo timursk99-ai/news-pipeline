@@ -30,24 +30,19 @@ CSV_TEMPLATE = "news_{ticker}.csv"
 TICKERS_FILE = "tickers.txt"
 SEEKINGALPHA_TEMPLATE = "https://seekingalpha.com/api/sa/combined/{ticker}.xml"
 
-# Limits and timeouts
 REQUEST_TIMEOUT = 20
 PER_TICKER_SLEEP = 1.0
 MAX_ARTICLES_PER_TICKER = 10
 
-# Hugging Face / MiniMax
 HF_API_KEY = os.environ.get("HF_API_KEY")
 HF_HEADERS = {"Authorization": f"Bearer {HF_API_KEY}"} if HF_API_KEY else {}
-# MiniMax text generation endpoint (model repo id)
 HF_MINIMAX = "https://api-inference.huggingface.co/models/MiniMaxAI/MiniMax-M2.5"
 HF_RETRIES = 3
 HF_BACKOFF_BASE = 1.5  # seconds
 
-# Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("news-pipeline")
 
-# CSV columns
 CSV_COLUMNS = ["Ticker", "Title", "URL", "Published", "Summary", "Sentiment", "Score", "FetchedAt"]
 
 # -------------------------
@@ -78,10 +73,9 @@ def fetch_feed_for_ticker(ticker: str) -> List[Any]:
         return []
 
 # -------------------------
-# MiniMax call + parsing (deterministic + robust)
+# MiniMax call + parsing
 # -------------------------
 def call_minimax(prompt: str, max_new_tokens: int = 256) -> Tuple[bool, str]:
-    """Call MiniMax model endpoint with deterministic params and retries. Returns (ok, text)."""
     if not HF_API_KEY:
         return False, "no_api_key"
     payload = {
@@ -100,12 +94,10 @@ def call_minimax(prompt: str, max_new_tokens: int = 256) -> Tuple[bool, str]:
             if r.status_code == 200:
                 try:
                     j = r.json()
-                    # Common shapes: dict with generated_text, or list of dicts
                     if isinstance(j, dict) and "generated_text" in j:
                         return True, j["generated_text"]
                     if isinstance(j, list) and j and isinstance(j[0], dict) and "generated_text" in j[0]:
                         return True, j[0]["generated_text"]
-                    # If the API returned a string or other JSON, convert to string
                     if isinstance(j, str):
                         return True, j
                     return True, json.dumps(j)
@@ -124,7 +116,7 @@ def call_minimax(prompt: str, max_new_tokens: int = 256) -> Tuple[bool, str]:
     return False, "max_retries"
 
 def parse_minimax_json(text: str) -> Dict[str, Any]:
-    """Try to extract JSON from model output. Also extract numeric fields via regex if JSON missing."""
+    """Robust JSON parsing from MiniMax output"""
     # 1) direct JSON
     try:
         parsed = json.loads(text)
@@ -133,56 +125,29 @@ def parse_minimax_json(text: str) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # 2) find JSON substring
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        snippet = text[start:end+1]
+    # 2) regex to find JSON-like blocks containing summary
+    matches = re.findall(r"\{.*?summary.*?\}", text, flags=re.DOTALL)
+    for m in matches:
         try:
-            parsed = json.loads(snippet)
-            if isinstance(parsed, dict):
+            parsed = json.loads(m)
+            if all(k in parsed for k in ["summary","sentiment_label","sentiment_score"]):
                 return parsed
         except Exception:
-            pass
+            continue
 
-    # 3) regex heuristics for key:value pairs like sentiment_score: 0.87 or "score": 0.87
+    # 3) fallback heuristics
     result: Dict[str, Any] = {}
-
-    # summary: capture between quotes after summary key or after "Summary:" lines
     m_summary = re.search(r'(?i)"?summary"?\s*[:=]\s*"(.*?)"', text, re.DOTALL)
-    if m_summary:
-        result["summary"] = m_summary.group(1).strip()
-    else:
-        m = re.search(r'(?i)summary[:=]\s*(.+?)(?:\n|$)', text)
-        if m:
-            result["summary"] = m.group(1).strip().strip('"')
-
-    # sentiment label
+    if m_summary: result["summary"] = m_summary.group(1).strip()
     m_label = re.search(r'(?i)"?(sentiment_label|sentiment|label)"?\s*[:=]\s*"?([A-Za-z]+)"?', text)
-    if m_label:
-        result["sentiment_label"] = m_label.group(2).strip().lower()
-
-    # numeric score patterns
+    if m_label: result["sentiment_label"] = m_label.group(2).strip().lower()
     m_score = re.search(r'(?i)"?(sentiment_score|score|sentiment_score_0_100)"?\s*[:=]\s*([+-]?\d+(\.\d+)?)', text)
     if m_score:
-        try:
-            result["sentiment_score"] = float(m_score.group(2))
-            return result
-        except Exception:
-            pass
-
-    # try to find any standalone number 0-1 or 0-100 near the word score
-    m_any = re.search(r'(?i)(score|sentiment)[^\d\-]{0,10}([+-]?\d+(\.\d+)?)', text)
-    if m_any:
-        try:
-            result["sentiment_score"] = float(m_any.group(2))
-        except Exception:
-            pass
-
+        try: result["sentiment_score"] = float(m_score.group(2))
+        except: pass
     return result
 
 def ask_minimax_for_summary_and_sentiment(text: str) -> Tuple[str, str, float]:
-    """Prompt MiniMax to return strict JSON. Parse and normalize score to 0-100."""
     prompt = (
         "You are a concise financial assistant. Respond with a single valid JSON object and nothing else. "
         "The JSON must contain exactly these keys: \"summary\", \"sentiment_label\", \"sentiment_score\". "
@@ -192,56 +157,45 @@ def ask_minimax_for_summary_and_sentiment(text: str) -> Tuple[str, str, float]:
     )
     ok, out = call_minimax(prompt, max_new_tokens=200)
     if not ok:
-        logger.debug(f"MiniMax call failed: {out}")
+        logger.warning(f"MiniMax call failed: {out}")
         return (text[:200], "neutral", 50.0)
 
+    logger.debug(f"MiniMax raw output: {out}")
+
     parsed = parse_minimax_json(out)
-    summary = parsed.get("summary") or ""
-    label = (parsed.get("sentiment_label") or parsed.get("sentiment") or "").lower()
+    summary = parsed.get("summary") or text[:200]
+    label = (parsed.get("sentiment_label") or "").lower()
     score = parsed.get("sentiment_score", None)
 
-    # Normalize score
+    # Normalize score to 0-100
     score_val = None
     try:
         if score is None:
             score_val = None
         else:
             score_val = float(score)
-            # If model returned 0-1, scale to 0-100
             if 0.0 <= score_val <= 1.0:
                 score_val = round(score_val * 100.0, 2)
+            elif -1.0 <= score_val <= 1.0:
+                score_val = round((score_val + 1.0) * 50.0, 2)
             else:
-                # If model returned -1..1, map to 0..100
-                if -1.0 <= score_val <= 1.0:
-                    score_val = round((score_val + 1.0) * 50.0, 2)
-                else:
-                    score_val = round(score_val, 2)
-    except Exception:
+                score_val = round(score_val, 2)
+    except:
         score_val = None
 
-    # If no numeric score, try heuristics from label
+    # Fallback heuristics if no score
     if score_val is None:
-        if label == "positive":
-            score_val = 75.0
-        elif label == "negative":
-            score_val = 25.0
-        else:
-            score_val = 50.0
+        if label == "positive": score_val = 75.0
+        elif label == "negative": score_val = 25.0
+        else: score_val = 50.0
 
-    # Normalize label if missing
-    if label not in ("positive", "neutral", "negative"):
-        if score_val >= 66:
-            label = "positive"
-        elif score_val <= 34:
-            label = "negative"
-        else:
-            label = "neutral"
+    # Normalize label
+    if label not in ("positive","neutral","negative"):
+        if score_val >= 66: label = "positive"
+        elif score_val <= 34: label = "negative"
+        else: label = "neutral"
 
-    # Final summary fallback
-    if not summary:
-        summary = text[:200]
-
-    return (summary, label, score_val)
+    return summary, label, score_val
 
 # -------------------------
 # Article extraction + CSV handling
@@ -251,11 +205,10 @@ def extract_article_row(ticker: str, entry: Any) -> Dict[str, Any]:
     link = getattr(entry, "link", "") or ""
     published = getattr(entry, "published", "") or getattr(entry, "updated", "") or ""
     raw_text = getattr(entry, "summary", "") or title
-    # Use MiniMax if API key present; otherwise fallback
     if HF_API_KEY:
         summary, label, score = ask_minimax_for_summary_and_sentiment(raw_text)
     else:
-        summary = raw_text[:200] if raw_text else ""
+        summary = raw_text[:200]
         label, score = "", 0.0
     return {
         "Ticker": ticker,
@@ -277,7 +230,7 @@ def load_existing_for_ticker(ticker: str) -> pd.DataFrame:
                 if c not in df.columns:
                     df[c] = ""
             return df[CSV_COLUMNS]
-        except Exception:
+        except:
             logger.warning(f"{fname} unreadable, starting fresh for {ticker}")
             return pd.DataFrame(columns=CSV_COLUMNS)
     return pd.DataFrame(columns=CSV_COLUMNS)
@@ -301,10 +254,7 @@ def main():
         entries = fetch_feed_for_ticker(ticker)
         for e in entries:
             url = getattr(e, "link", "") or ""
-            if not url:
-                continue
-            if url in existing_urls:
-                logger.debug(f"{ticker}: skipping existing URL {url}")
+            if not url or url in existing_urls:
                 continue
             try:
                 row = extract_article_row(ticker, e)
@@ -319,7 +269,6 @@ def main():
         else:
             df = existing
 
-        # Ensure columns and write CSV for this ticker
         for c in CSV_COLUMNS:
             if c not in df.columns:
                 df[c] = ""
