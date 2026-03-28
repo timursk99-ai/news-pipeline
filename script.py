@@ -36,8 +36,8 @@ MAX_ARTICLES_PER_TICKER = 10
 # Hugging Face configuration
 HF_API_KEY = os.environ.get("HF_API_KEY")
 HF_HEADERS = {"Authorization": f"Bearer {HF_API_KEY}"} if HF_API_KEY else {}
-HF_SUMMARIZER = "https://api-inference.huggingface.co/models/facebook/bart-large-cnn"
-HF_SENTIMENT = "https://api-inference.huggingface.co/models/peejm/finbert-financial-sentiment"
+HF_SUMMARIZER = "https://api-inference.huggingface.co/models/MiniMaxAI/MiniMax-M2.5"
+HF_SENTIMENT = "https://api-inference.huggingface.co/models/MiniMaxAI/MiniMax-M2.5"
 HF_RETRIES = 3
 HF_BACKOFF_BASE = 1.5  # seconds
 
