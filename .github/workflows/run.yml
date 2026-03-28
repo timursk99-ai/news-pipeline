@@ -5,19 +5,18 @@ on:
     - cron: "*/15 * * * *"
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
   run-script:
     runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.10"
 
@@ -29,10 +28,20 @@ jobs:
           HF_API_KEY: ${{ secrets.HF_API_KEY }}
         run: python script.py
 
-      - name: Commit updated CSV
+      - name: Commit updated CSV (safe)
         run: |
           git config --global user.name "bot"
           git config --global user.email "bot@github.com"
-          git add news_data.csv
-          git commit -m "update data" || echo "no changes"
-          git push
+
+          # Only add and commit if the file exists and there are changes
+          if [ -f news_data.csv ]; then
+            git add news_data.csv
+            if ! git diff --cached --quiet; then
+              git commit -m "update data"
+              git push
+            else
+              echo "news_data.csv exists but no changes to commit"
+            fi
+          else
+            echo "news_data.csv not found; skipping commit"
+          fi
