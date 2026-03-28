@@ -6,7 +6,45 @@ on:
   workflow_dispatch:
 
 jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: MiniMax smoke test (fast)
+        env:
+          HF_API_KEY: ${{ secrets.HF_API_KEY }}
+        run: |
+          python - <<'PY'
+          import os, requests, json
+          HF_API_KEY = os.environ.get("HF_API_KEY")
+          if not HF_API_KEY:
+            print("HF_API_KEY not set; smoke test skipped")
+            raise SystemExit(0)
+          headers = {"Authorization": f"Bearer {HF_API_KEY}"}
+          endpoint = "https://api-inference.huggingface.co/models/MiniMaxAI/MiniMax-M2.5"
+          prompt = "Return a JSON object with keys summary, sentiment_label, sentiment_score for the text: 'Apple reports strong quarterly revenue.'"
+          r = requests.post(endpoint, headers=headers, json={"inputs": prompt, "options": {"wait_for_model": True}}, timeout=60)
+          print("status:", r.status_code)
+          try:
+            print("response:", r.json())
+          except Exception:
+            print("text:", r.text[:2000])
+          PY
+
   run-script:
+    needs: smoke-test
     runs-on: ubuntu-latest
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -69,7 +107,6 @@ jobs:
             git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
           fi
 
-          # Stage all news CSVs that exist
           shopt -s nullglob
           files=(news_*.csv)
           if [ ${#files[@]} -eq 0 ]; then
