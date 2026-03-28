@@ -8,8 +8,6 @@ on:
 jobs:
   smoke-test:
     runs-on: ubuntu-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -22,25 +20,28 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
-      - name: MiniMax smoke test (fast)
+      - name: Gemini smoke test (fast)
         env:
-          HF_API_KEY: ${{ secrets.HF_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           python - <<'PY'
           import os, requests, json
-          HF_API_KEY = os.environ.get("HF_API_KEY")
-          if not HF_API_KEY:
-            print("HF_API_KEY not set; smoke test skipped")
+          key = os.environ.get("GEMINI_API_KEY")
+          if not key:
+            print("GEMINI_API_KEY not set; smoke test skipped")
             raise SystemExit(0)
-          headers = {"Authorization": f"Bearer {HF_API_KEY}"}
-          endpoint = "https://api-inference.huggingface.co/models/MiniMaxAI/MiniMax-M2.5"
-          prompt = "Return a JSON object with keys summary, sentiment_label, sentiment_score for the text: 'Apple reports strong quarterly revenue.'"
-          r = requests.post(endpoint, headers=headers, json={"inputs": prompt, "options": {"wait_for_model": True}}, timeout=60)
+          endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=" + key
+          prompt = ("You are a concise financial assistant. Respond with a single valid JSON object and nothing else. "
+                    "The JSON must contain exactly these keys: \"summary\", \"sentiment_label\", \"sentiment_score\". "
+                    "\"summary\" must be 1-2 sentences. \"sentiment_label\" must be one of: positive, neutral, negative. "
+                    "\"sentiment_score\" must be a number from 0 to 100. Input: Apple reports strong quarterly revenue.")
+          body = {"content":[{"parts":[{"text": prompt}]}], "temperature":0.0, "maxOutputTokens":200}
+          r = requests.post(endpoint, headers={"Content-Type":"application/json"}, json=body, timeout=60)
           print("status:", r.status_code)
           try:
-            print("response:", r.json())
+            print("response:", json.dumps(r.json(), indent=2)[:4000])
           except Exception:
-            print("text:", r.text[:2000])
+            print("text:", r.text[:4000])
           PY
 
   run-script:
@@ -64,19 +65,13 @@ jobs:
       - name: Debug environment (optional)
         run: |
           echo "Python: $(python --version)"
-          echo "Workspace:"
           pwd
           ls -la
-          if [ -f tickers.txt ]; then
-            echo "tickers.txt:"
-            cat tickers.txt
-          else
-            echo "tickers.txt missing"
-          fi
+          if [ -f tickers.txt ]; then cat tickers.txt; else echo "tickers.txt missing"; fi
 
       - name: Run script
         env:
-          HF_API_KEY: ${{ secrets.HF_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           set -o pipefail
           python -u script.py
@@ -97,32 +92,24 @@ jobs:
           BRANCH: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-
           git config --global user.name "bot"
           git config --global user.email "bot@github.com"
-
           git checkout -q "$BRANCH" || true
-
           if [ -n "${GITHUB_TOKEN:-}" ]; then
             git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
           fi
-
           shopt -s nullglob
           files=(news_*.csv)
           if [ ${#files[@]} -eq 0 ]; then
             echo "No news_*.csv files to commit; exiting"
             exit 0
           fi
-
           git add "${files[@]}"
-
           if git diff --cached --quiet; then
             echo "No changes to commit"
             exit 0
           fi
-
           git fetch origin "$BRANCH"
-
           if git rev-parse --verify "origin/$BRANCH" >/dev/null 2>&1; then
             echo "Rebasing on top of origin/$BRANCH"
             git commit -m "update news CSVs" || true
@@ -134,7 +121,6 @@ jobs:
           else
             git commit -m "update news CSVs" || true
           fi
-
           if git push origin "HEAD:$BRANCH"; then
             echo "Pushed changes to origin/$BRANCH"
           else
