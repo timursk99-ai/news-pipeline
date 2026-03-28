@@ -4,11 +4,11 @@ script.py
 
 - Reads tickers from tickers.txt (one ticker per line)
 - Fetches Seeking Alpha RSS for each ticker
-- Calls MiniMax-M2.5 via Hugging Face Inference API for summary + sentiment
+- Calls Google Gemini (Generative Language REST API) for summary + sentiment
 - Writes one CSV per ticker: news_{TICKER}.csv
 - Sentiment Score is scaled 0-100
 - Skips duplicate URLs already present in each ticker CSV
-- Includes retries, backoff, deterministic generation parameters, and robust parsing
+- Includes retries, backoff, deterministic prompt, and robust parsing
 """
 
 import os
@@ -30,19 +30,26 @@ CSV_TEMPLATE = "news_{ticker}.csv"
 TICKERS_FILE = "tickers.txt"
 SEEKINGALPHA_TEMPLATE = "https://seekingalpha.com/api/sa/combined/{ticker}.xml"
 
+# Limits and timeouts
 REQUEST_TIMEOUT = 20
 PER_TICKER_SLEEP = 1.0
 MAX_ARTICLES_PER_TICKER = 10
 
-HF_API_KEY = os.environ.get("HF_API_KEY")
-HF_HEADERS = {"Authorization": f"Bearer {HF_API_KEY}"} if HF_API_KEY else {}
-HF_MINIMAX = "https://api-inference.huggingface.co/models/MiniMaxAI/MiniMax-M2.5"
-HF_RETRIES = 3
-HF_BACKOFF_BASE = 1.5  # seconds
+# Gemini / Google Generative Language
+# The script expects the API key in the environment variable GEMINI_API_KEY
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+# Model to call (change if you want another Gemini model)
+GEMINI_MODEL = "gemini-1.5-flash"
+GEMINI_ENDPOINT_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
 
+GEMINI_RETRIES = 3
+GEMINI_BACKOFF_BASE = 1.5  # seconds
+
+# Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("news-pipeline")
 
+# CSV columns
 CSV_COLUMNS = ["Ticker", "Title", "URL", "Published", "Summary", "Sentiment", "Score", "FetchedAt"]
 
 # -------------------------
@@ -73,81 +80,119 @@ def fetch_feed_for_ticker(ticker: str) -> List[Any]:
         return []
 
 # -------------------------
-# MiniMax call + parsing
+# Gemini call + parsing (deterministic + robust)
 # -------------------------
-def call_minimax(prompt: str, max_new_tokens: int = 256) -> Tuple[bool, str]:
-    if not HF_API_KEY:
+def call_gemini(prompt: str, max_output_tokens: int = 256) -> Tuple[bool, str]:
+    """Call Gemini generateContent REST endpoint with retries. Returns (ok, text)."""
+    if not GEMINI_API_KEY:
         return False, "no_api_key"
-    payload = {
-        "inputs": prompt,
-        "parameters": {
-            "temperature": 0.0,
-            "top_p": 1.0,
-            "max_new_tokens": max_new_tokens,
-            "repetition_penalty": 1.0
-        },
-        "options": {"wait_for_model": True}
+    endpoint = GEMINI_ENDPOINT_TEMPLATE.format(model=GEMINI_MODEL, key=GEMINI_API_KEY)
+    headers = {"Content-Type": "application/json"}
+    # Use deterministic parameters: temperature 0.0
+    body = {
+        "content": [
+            {
+                "parts": [
+                    {"text": prompt}
+                ]
+            }
+        ],
+        "temperature": 0.0,
+        "maxOutputTokens": max_output_tokens
     }
-    for attempt in range(1, HF_RETRIES + 1):
+    for attempt in range(1, GEMINI_RETRIES + 1):
         try:
-            r = requests.post(HF_MINIMAX, headers=HF_HEADERS, json=payload, timeout=60)
+            r = requests.post(endpoint, headers=headers, json=body, timeout=60)
             if r.status_code == 200:
                 try:
                     j = r.json()
-                    if isinstance(j, dict) and "generated_text" in j:
-                        return True, j["generated_text"]
-                    if isinstance(j, list) and j and isinstance(j[0], dict) and "generated_text" in j[0]:
-                        return True, j[0]["generated_text"]
-                    if isinstance(j, str):
-                        return True, j
+                    # Typical shape: {"candidates":[{"content":{"parts":[{"text":"..."}]}}], ...}
+                    if isinstance(j, dict):
+                        cands = j.get("candidates") or j.get("candidates", [])
+                        if isinstance(cands, list) and cands:
+                            first = cands[0]
+                            # drill into content.parts[0].text
+                            content = first.get("content") or {}
+                            parts = content.get("parts") or []
+                            if isinstance(parts, list) and parts:
+                                text = parts[0].get("text") or ""
+                                return True, text
+                        # fallback: try top-level text fields
+                        if "output" in j and isinstance(j["output"], dict):
+                            # some responses may have output.candidates etc.
+                            try:
+                                out_cands = j["output"].get("candidates", [])
+                                if out_cands and isinstance(out_cands[0], dict):
+                                    parts = out_cands[0].get("content", {}).get("parts", [])
+                                    if parts:
+                                        return True, parts[0].get("text", "")
+                            except Exception:
+                                pass
+                    # fallback to stringified JSON
                     return True, json.dumps(j)
                 except Exception:
                     return False, r.text[:2000]
             if r.status_code in (429, 500, 502, 503, 504):
-                wait = HF_BACKOFF_BASE ** attempt
-                logger.warning(f"MiniMax returned {r.status_code}. Backing off {wait:.1f}s (attempt {attempt})")
+                wait = GEMINI_BACKOFF_BASE ** attempt
+                logger.warning(f"Gemini returned {r.status_code}. Backing off {wait:.1f}s (attempt {attempt})")
                 time.sleep(wait)
                 continue
             return False, f"status:{r.status_code} text:{r.text[:500]}"
         except requests.RequestException as e:
-            wait = HF_BACKOFF_BASE ** attempt
-            logger.warning(f"MiniMax request exception {e}. Backing off {wait:.1f}s (attempt {attempt})")
+            wait = GEMINI_BACKOFF_BASE ** attempt
+            logger.warning(f"Gemini request exception {e}. Backing off {wait:.1f}s (attempt {attempt})")
             time.sleep(wait)
     return False, "max_retries"
 
-def parse_minimax_json(text: str) -> Dict[str, Any]:
-    """Robust JSON parsing from MiniMax output"""
-    # 1) direct JSON
+def parse_json_from_text(text: str) -> Dict[str, Any]:
+    """Extract JSON object from text if present; otherwise use regex heuristics."""
+    # direct JSON
     try:
         parsed = json.loads(text)
         if isinstance(parsed, dict):
             return parsed
     except Exception:
         pass
-
-    # 2) regex to find JSON-like blocks containing summary
-    matches = re.findall(r"\{.*?summary.*?\}", text, flags=re.DOTALL)
-    for m in matches:
+    # find JSON substring
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        snippet = text[start:end+1]
         try:
-            parsed = json.loads(m)
-            if all(k in parsed for k in ["summary","sentiment_label","sentiment_score"]):
+            parsed = json.loads(snippet)
+            if isinstance(parsed, dict):
                 return parsed
         except Exception:
-            continue
-
-    # 3) fallback heuristics
+            pass
+    # heuristics
     result: Dict[str, Any] = {}
     m_summary = re.search(r'(?i)"?summary"?\s*[:=]\s*"(.*?)"', text, re.DOTALL)
-    if m_summary: result["summary"] = m_summary.group(1).strip()
+    if m_summary:
+        result["summary"] = m_summary.group(1).strip()
+    else:
+        m = re.search(r'(?i)summary[:=]\s*(.+?)(?:\n|$)', text)
+        if m:
+            result["summary"] = m.group(1).strip().strip('"')
     m_label = re.search(r'(?i)"?(sentiment_label|sentiment|label)"?\s*[:=]\s*"?([A-Za-z]+)"?', text)
-    if m_label: result["sentiment_label"] = m_label.group(2).strip().lower()
+    if m_label:
+        result["sentiment_label"] = m_label.group(2).strip().lower()
     m_score = re.search(r'(?i)"?(sentiment_score|score|sentiment_score_0_100)"?\s*[:=]\s*([+-]?\d+(\.\d+)?)', text)
     if m_score:
-        try: result["sentiment_score"] = float(m_score.group(2))
-        except: pass
+        try:
+            result["sentiment_score"] = float(m_score.group(2))
+            return result
+        except Exception:
+            pass
+    m_any = re.search(r'(?i)(score|sentiment)[^\d\-]{0,10}([+-]?\d+(\.\d+)?)', text)
+    if m_any:
+        try:
+            result["sentiment_score"] = float(m_any.group(2))
+        except Exception:
+            pass
     return result
 
-def ask_minimax_for_summary_and_sentiment(text: str) -> Tuple[str, str, float]:
+def ask_gemini_for_summary_and_sentiment(text: str) -> Tuple[str, str, float]:
+    """Prompt Gemini to return strict JSON. Parse and normalize score to 0-100."""
     prompt = (
         "You are a concise financial assistant. Respond with a single valid JSON object and nothing else. "
         "The JSON must contain exactly these keys: \"summary\", \"sentiment_label\", \"sentiment_score\". "
@@ -155,19 +200,17 @@ def ask_minimax_for_summary_and_sentiment(text: str) -> Tuple[str, str, float]:
         "\"sentiment_score\" must be a number from 0 to 100 (0 = most negative, 100 = most positive). "
         "Do not include any extra commentary or explanation. Input:\n\n" + text
     )
-    ok, out = call_minimax(prompt, max_new_tokens=200)
+    ok, out = call_gemini(prompt, max_output_tokens=200)
     if not ok:
-        logger.warning(f"MiniMax call failed: {out}")
+        logger.debug(f"Gemini call failed: {out}")
         return (text[:200], "neutral", 50.0)
 
-    logger.debug(f"MiniMax raw output: {out}")
-
-    parsed = parse_minimax_json(out)
-    summary = parsed.get("summary") or text[:200]
-    label = (parsed.get("sentiment_label") or "").lower()
+    parsed = parse_json_from_text(out)
+    summary = parsed.get("summary") or ""
+    label = (parsed.get("sentiment_label") or parsed.get("sentiment") or "").lower()
     score = parsed.get("sentiment_score", None)
 
-    # Normalize score to 0-100
+    # Normalize score
     score_val = None
     try:
         if score is None:
@@ -176,26 +219,34 @@ def ask_minimax_for_summary_and_sentiment(text: str) -> Tuple[str, str, float]:
             score_val = float(score)
             if 0.0 <= score_val <= 1.0:
                 score_val = round(score_val * 100.0, 2)
-            elif -1.0 <= score_val <= 1.0:
-                score_val = round((score_val + 1.0) * 50.0, 2)
             else:
-                score_val = round(score_val, 2)
-    except:
+                if -1.0 <= score_val <= 1.0:
+                    score_val = round((score_val + 1.0) * 50.0, 2)
+                else:
+                    score_val = round(score_val, 2)
+    except Exception:
         score_val = None
 
-    # Fallback heuristics if no score
     if score_val is None:
-        if label == "positive": score_val = 75.0
-        elif label == "negative": score_val = 25.0
-        else: score_val = 50.0
+        if label == "positive":
+            score_val = 75.0
+        elif label == "negative":
+            score_val = 25.0
+        else:
+            score_val = 50.0
 
-    # Normalize label
-    if label not in ("positive","neutral","negative"):
-        if score_val >= 66: label = "positive"
-        elif score_val <= 34: label = "negative"
-        else: label = "neutral"
+    if label not in ("positive", "neutral", "negative"):
+        if score_val >= 66:
+            label = "positive"
+        elif score_val <= 34:
+            label = "negative"
+        else:
+            label = "neutral"
 
-    return summary, label, score_val
+    if not summary:
+        summary = text[:200]
+
+    return (summary, label, score_val)
 
 # -------------------------
 # Article extraction + CSV handling
@@ -205,10 +256,10 @@ def extract_article_row(ticker: str, entry: Any) -> Dict[str, Any]:
     link = getattr(entry, "link", "") or ""
     published = getattr(entry, "published", "") or getattr(entry, "updated", "") or ""
     raw_text = getattr(entry, "summary", "") or title
-    if HF_API_KEY:
-        summary, label, score = ask_minimax_for_summary_and_sentiment(raw_text)
+    if GEMINI_API_KEY:
+        summary, label, score = ask_gemini_for_summary_and_sentiment(raw_text)
     else:
-        summary = raw_text[:200]
+        summary = raw_text[:200] if raw_text else ""
         label, score = "", 0.0
     return {
         "Ticker": ticker,
@@ -230,7 +281,7 @@ def load_existing_for_ticker(ticker: str) -> pd.DataFrame:
                 if c not in df.columns:
                     df[c] = ""
             return df[CSV_COLUMNS]
-        except:
+        except Exception:
             logger.warning(f"{fname} unreadable, starting fresh for {ticker}")
             return pd.DataFrame(columns=CSV_COLUMNS)
     return pd.DataFrame(columns=CSV_COLUMNS)
@@ -254,7 +305,10 @@ def main():
         entries = fetch_feed_for_ticker(ticker)
         for e in entries:
             url = getattr(e, "link", "") or ""
-            if not url or url in existing_urls:
+            if not url:
+                continue
+            if url in existing_urls:
+                logger.debug(f"{ticker}: skipping existing URL {url}")
                 continue
             try:
                 row = extract_article_row(ticker, e)
