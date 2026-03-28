@@ -5,8 +5,9 @@ script.py
 - Reads tickers from tickers.txt (one ticker per line)
 - Fetches Seeking Alpha RSS for each ticker
 - Calls Hugging Face inference for summary and sentiment when HF_API_KEY is set
-- Writes news_data.csv with columns: Ticker, Title, URL, Published, Summary, Sentiment, Score, FetchedAt
-- Skips duplicate URLs already present in news_data.csv
+- Writes one CSV per ticker: news_{TICKER}.csv
+- Sentiment Score is scaled 0-100
+- Skips duplicate URLs already present in each ticker CSV
 - Includes retries, backoff, and logging
 """
 
@@ -23,7 +24,7 @@ import pandas as pd
 # -------------------------
 # Configuration
 # -------------------------
-CSV_FILE = "news_data.csv"
+CSV_TEMPLATE = "news_{ticker}.csv"
 TICKERS_FILE = "tickers.txt"
 SEEKINGALPHA_TEMPLATE = "https://seekingalpha.com/api/sa/combined/{ticker}.xml"
 
@@ -36,7 +37,7 @@ MAX_ARTICLES_PER_TICKER = 10
 HF_API_KEY = os.environ.get("HF_API_KEY")
 HF_HEADERS = {"Authorization": f"Bearer {HF_API_KEY}"} if HF_API_KEY else {}
 HF_SUMMARIZER = "https://api-inference.huggingface.co/models/facebook/bart-large-cnn"
-HF_SENTIMENT = "https://api-inference.huggingface.co/models/distilbert-base-uncased-finetuned-sst-2-english"
+HF_SENTIMENT = "https://api-inference.huggingface.co/models/peejm/finbert-financial-sentiment"
 HF_RETRIES = 3
 HF_BACKOFF_BASE = 1.5  # seconds
 
@@ -112,19 +113,24 @@ def summarize_text(text: str) -> str:
     return str(out)[:200]
 
 def sentiment_text(text: str) -> Tuple[str, float]:
+    """Return (label, score_0_100). Score scaled to 0-100."""
     if not text:
         return "", 0.0
     ok, out = call_hf(HF_SENTIMENT, {"inputs": text[:2000]})
     if not ok:
         logger.debug(f"Sentiment failed: {out}")
         return "", 0.0
+    # peejm/finbert-financial-sentiment returns a list of dicts like [{"label":"positive","score":0.9}, ...]
     try:
         if isinstance(out, list) and out and isinstance(out[0], dict):
             label = out[0].get("label", "")
-            score = float(out[0].get("score", 0.0))
-            return label, score
+            score01 = float(out[0].get("score", 0.0))
+            score100 = round(score01 * 100, 2)
+            return label, score100
         if isinstance(out, dict) and "label" in out:
-            return out.get("label", ""), float(out.get("score", 0.0))
+            label = out.get("label", "")
+            score01 = float(out.get("score", 0.0))
+            return label, round(score01 * 100, 2)
     except Exception:
         logger.exception("Error parsing HF sentiment response")
     return "", 0.0
@@ -148,17 +154,17 @@ def extract_article_row(ticker: str, entry: Any) -> Dict[str, Any]:
         "FetchedAt": datetime.utcnow().isoformat() + "Z"
     }
 
-def load_existing() -> pd.DataFrame:
-    if os.path.exists(CSV_FILE):
+def load_existing_for_ticker(ticker: str) -> pd.DataFrame:
+    fname = CSV_TEMPLATE.format(ticker=ticker)
+    if os.path.exists(fname):
         try:
-            df = pd.read_csv(CSV_FILE)
-            # Ensure expected columns exist
+            df = pd.read_csv(fname)
             for c in CSV_COLUMNS:
                 if c not in df.columns:
                     df[c] = ""
             return df[CSV_COLUMNS]
         except Exception:
-            logger.warning("Existing CSV unreadable, starting fresh")
+            logger.warning(f"{fname} unreadable, starting fresh for {ticker}")
             return pd.DataFrame(columns=CSV_COLUMNS)
     return pd.DataFrame(columns=CSV_COLUMNS)
 
@@ -172,39 +178,42 @@ def main():
         logger.error("No tickers to process. Exiting.")
         return
 
-    existing = load_existing()
-    existing_urls = set(existing["URL"].astype(str).tolist()) if not existing.empty else set()
-
-    rows = []
     for ticker in tickers:
+        logger.info(f"Processing {ticker}")
+        existing = load_existing_for_ticker(ticker)
+        existing_urls = set(existing["URL"].astype(str).tolist()) if not existing.empty else set()
+
+        rows = []
         entries = fetch_feed_for_ticker(ticker)
         for e in entries:
             url = getattr(e, "link", "") or ""
             if not url:
                 continue
             if url in existing_urls:
-                logger.debug(f"Skipping existing URL {url}")
+                logger.debug(f"{ticker}: skipping existing URL {url}")
                 continue
             try:
                 row = extract_article_row(ticker, e)
                 rows.append(row)
             except Exception:
-                logger.exception(f"Error extracting article for {ticker}; skipping")
+                logger.exception(f"{ticker}: error extracting article; skipping")
         time.sleep(PER_TICKER_SLEEP)
 
-    if rows:
-        df_new = pd.DataFrame(rows)
-        df = pd.concat([df_new, existing], ignore_index=True).drop_duplicates(subset=["URL"])
-    else:
-        df = existing
+        if rows:
+            df_new = pd.DataFrame(rows)
+            df = pd.concat([df_new, existing], ignore_index=True).drop_duplicates(subset=["URL"])
+        else:
+            df = existing
 
-    # Ensure columns and write CSV
-    for c in CSV_COLUMNS:
-        if c not in df.columns:
-            df[c] = ""
-    df = df[CSV_COLUMNS]
-    df.to_csv(CSV_FILE, index=False)
-    logger.info(f"Wrote {len(df)} rows to {CSV_FILE}")
+        # Ensure columns and write CSV for this ticker
+        for c in CSV_COLUMNS:
+            if c not in df.columns:
+                df[c] = ""
+        df = df[CSV_COLUMNS]
+        fname = CSV_TEMPLATE.format(ticker=ticker)
+        df.to_csv(fname, index=False)
+        logger.info(f"Wrote {len(df)} rows to {fname}")
+
     logger.info("Script end")
 
 if __name__ == "__main__":
