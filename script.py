@@ -1,102 +1,22 @@
-#!/usr/bin/env python3
-"""
-script.py
-
-- Reads tickers from tickers.txt (one ticker per line)
-- Fetches Seeking Alpha RSS for each ticker
-- Calls Google Gemini (Generative Language REST API) for summary + sentiment
-- Writes one CSV per ticker: news_{TICKER}.csv
-- Sentiment Score is scaled 0-100
-- Skips duplicate URLs already present in each ticker CSV
-- Includes retries, backoff, deterministic prompt, and robust parsing
-"""
-
-import os
-import time
-import json
-import re
-import logging
-from datetime import datetime
-from typing import Tuple, List, Dict, Any
-
+import os, time, json, re, logging
+from typing import Tuple, Dict, Any
 import requests
-import feedparser
-import pandas as pd
 
-# -------------------------
-# Configuration
-# -------------------------
-CSV_TEMPLATE = "news_{ticker}.csv"
-TICKERS_FILE = "tickers.txt"
-SEEKINGALPHA_TEMPLATE = "https://seekingalpha.com/api/sa/combined/{ticker}.xml"
-
-# Limits and timeouts
-REQUEST_TIMEOUT = 20
-PER_TICKER_SLEEP = 1.0
-MAX_ARTICLES_PER_TICKER = 10
-
-# Gemini / Google Generative Language
-# The script expects the API key in the environment variable GEMINI_API_KEY
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-# Model to call (change if you want another Gemini model)
-GEMINI_MODEL = "gemini-1.5-flash"
+GEMINI_MODEL = "gemini-1.5-flash"  # change if needed
 GEMINI_ENDPOINT_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
-
 GEMINI_RETRIES = 3
-GEMINI_BACKOFF_BASE = 1.5  # seconds
-
-# Logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+GEMINI_BACKOFF_BASE = 1.5
 logger = logging.getLogger("news-pipeline")
 
-# CSV columns
-CSV_COLUMNS = ["Ticker", "Title", "URL", "Published", "Summary", "Sentiment", "Score", "FetchedAt"]
-
-# -------------------------
-# Utilities
-# -------------------------
-def load_tickers() -> List[str]:
-    if not os.path.exists(TICKERS_FILE):
-        logger.warning(f"{TICKERS_FILE} not found")
-        return []
-    with open(TICKERS_FILE, "r", encoding="utf-8") as f:
-        tickers = [line.strip().upper() for line in f if line.strip()]
-    logger.info(f"Loaded {len(tickers)} tickers")
-    return tickers
-
-def fetch_feed_for_ticker(ticker: str) -> List[Any]:
-    url = SEEKINGALPHA_TEMPLATE.format(ticker=ticker)
-    try:
-        r = requests.get(url, timeout=REQUEST_TIMEOUT, headers={"User-Agent": "news-bot/1.0"})
-        if r.status_code != 200:
-            logger.warning(f"{ticker}: feed returned status {r.status_code}")
-            return []
-        feed = feedparser.parse(r.content)
-        entries = feed.entries[:MAX_ARTICLES_PER_TICKER]
-        logger.info(f"{ticker}: found {len(entries)} entries")
-        return entries
-    except Exception as e:
-        logger.exception(f"{ticker}: error fetching feed: {e}")
-        return []
-
-# -------------------------
-# Gemini call + parsing (deterministic + robust)
-# -------------------------
-def call_gemini(prompt: str, max_output_tokens: int = 256) -> Tuple[bool, str]:
+def call_gemini(prompt: str, max_output_tokens: int = 200) -> Tuple[bool, str]:
     """Call Gemini generateContent REST endpoint with retries. Returns (ok, text)."""
     if not GEMINI_API_KEY:
         return False, "no_api_key"
     endpoint = GEMINI_ENDPOINT_TEMPLATE.format(model=GEMINI_MODEL, key=GEMINI_API_KEY)
     headers = {"Content-Type": "application/json"}
-    # Use deterministic parameters: temperature 0.0
     body = {
-        "content": [
-            {
-                "parts": [
-                    {"text": prompt}
-                ]
-            }
-        ],
+        "content": [{"parts": [{"text": prompt}]}],
         "temperature": 0.0,
         "maxOutputTokens": max_output_tokens
     }
@@ -106,32 +26,30 @@ def call_gemini(prompt: str, max_output_tokens: int = 256) -> Tuple[bool, str]:
             if r.status_code == 200:
                 try:
                     j = r.json()
-                    # Typical shape: {"candidates":[{"content":{"parts":[{"text":"..."}]}}], ...}
-                    if isinstance(j, dict):
-                        cands = j.get("candidates") or j.get("candidates", [])
-                        if isinstance(cands, list) and cands:
-                            first = cands[0]
-                            # drill into content.parts[0].text
-                            content = first.get("content") or {}
-                            parts = content.get("parts") or []
-                            if isinstance(parts, list) and parts:
-                                text = parts[0].get("text") or ""
-                                return True, text
-                        # fallback: try top-level text fields
-                        if "output" in j and isinstance(j["output"], dict):
-                            # some responses may have output.candidates etc.
-                            try:
-                                out_cands = j["output"].get("candidates", [])
-                                if out_cands and isinstance(out_cands[0], dict):
-                                    parts = out_cands[0].get("content", {}).get("parts", [])
-                                    if parts:
-                                        return True, parts[0].get("text", "")
-                            except Exception:
-                                pass
+                except Exception:
+                    return False, r.text[:2000]
+                # Typical response shape: candidates -> content -> parts -> text
+                try:
+                    cands = j.get("candidates") or j.get("candidates", [])
+                    if isinstance(cands, list) and cands:
+                        first = cands[0]
+                        content = first.get("content") or {}
+                        parts = content.get("parts") or []
+                        if isinstance(parts, list) and parts:
+                            text = parts[0].get("text") or ""
+                            return True, text
+                    # fallback: try output.candidates
+                    out = j.get("output") or {}
+                    ocands = out.get("candidates") or []
+                    if ocands and isinstance(ocands[0], dict):
+                        parts = ocands[0].get("content", {}).get("parts", [])
+                        if parts:
+                            return True, parts[0].get("text", "")
                     # fallback to stringified JSON
                     return True, json.dumps(j)
                 except Exception:
-                    return False, r.text[:2000]
+                    return False, json.dumps(j)[:2000]
+            # transient errors: backoff
             if r.status_code in (429, 500, 502, 503, 504):
                 wait = GEMINI_BACKOFF_BASE ** attempt
                 logger.warning(f"Gemini returned {r.status_code}. Backing off {wait:.1f}s (attempt {attempt})")
@@ -144,16 +62,16 @@ def call_gemini(prompt: str, max_output_tokens: int = 256) -> Tuple[bool, str]:
             time.sleep(wait)
     return False, "max_retries"
 
-def parse_json_from_text(text: str) -> Dict[str, Any]:
-    """Extract JSON object from text if present; otherwise use regex heuristics."""
-    # direct JSON
+def _extract_json_or_heuristics(text: str) -> Dict[str, Any]:
+    """Return dict parsed from JSON in text or heuristics for summary/label/score."""
+    # 1) direct JSON
     try:
         parsed = json.loads(text)
         if isinstance(parsed, dict):
             return parsed
     except Exception:
         pass
-    # find JSON substring
+    # 2) JSON substring
     start = text.find("{")
     end = text.rfind("}")
     if start != -1 and end != -1 and end > start:
@@ -164,7 +82,7 @@ def parse_json_from_text(text: str) -> Dict[str, Any]:
                 return parsed
         except Exception:
             pass
-    # heuristics
+    # 3) heuristics via regex
     result: Dict[str, Any] = {}
     m_summary = re.search(r'(?i)"?summary"?\s*[:=]\s*"(.*?)"', text, re.DOTALL)
     if m_summary:
@@ -205,12 +123,12 @@ def ask_gemini_for_summary_and_sentiment(text: str) -> Tuple[str, str, float]:
         logger.debug(f"Gemini call failed: {out}")
         return (text[:200], "neutral", 50.0)
 
-    parsed = parse_json_from_text(out)
+    parsed = _extract_json_or_heuristics(out)
     summary = parsed.get("summary") or ""
     label = (parsed.get("sentiment_label") or parsed.get("sentiment") or "").lower()
     score = parsed.get("sentiment_score", None)
 
-    # Normalize score
+    # Normalize numeric score to 0-100
     score_val = None
     try:
         if score is None:
@@ -247,91 +165,3 @@ def ask_gemini_for_summary_and_sentiment(text: str) -> Tuple[str, str, float]:
         summary = text[:200]
 
     return (summary, label, score_val)
-
-# -------------------------
-# Article extraction + CSV handling
-# -------------------------
-def extract_article_row(ticker: str, entry: Any) -> Dict[str, Any]:
-    title = getattr(entry, "title", "") or ""
-    link = getattr(entry, "link", "") or ""
-    published = getattr(entry, "published", "") or getattr(entry, "updated", "") or ""
-    raw_text = getattr(entry, "summary", "") or title
-    if GEMINI_API_KEY:
-        summary, label, score = ask_gemini_for_summary_and_sentiment(raw_text)
-    else:
-        summary = raw_text[:200] if raw_text else ""
-        label, score = "", 0.0
-    return {
-        "Ticker": ticker,
-        "Title": title,
-        "URL": link,
-        "Published": published,
-        "Summary": summary,
-        "Sentiment": label,
-        "Score": score,
-        "FetchedAt": datetime.utcnow().isoformat() + "Z"
-    }
-
-def load_existing_for_ticker(ticker: str) -> pd.DataFrame:
-    fname = CSV_TEMPLATE.format(ticker=ticker)
-    if os.path.exists(fname):
-        try:
-            df = pd.read_csv(fname)
-            for c in CSV_COLUMNS:
-                if c not in df.columns:
-                    df[c] = ""
-            return df[CSV_COLUMNS]
-        except Exception:
-            logger.warning(f"{fname} unreadable, starting fresh for {ticker}")
-            return pd.DataFrame(columns=CSV_COLUMNS)
-    return pd.DataFrame(columns=CSV_COLUMNS)
-
-# -------------------------
-# Main
-# -------------------------
-def main():
-    logger.info("Script start")
-    tickers = load_tickers()
-    if not tickers:
-        logger.error("No tickers to process. Exiting.")
-        return
-
-    for ticker in tickers:
-        logger.info(f"Processing {ticker}")
-        existing = load_existing_for_ticker(ticker)
-        existing_urls = set(existing["URL"].astype(str).tolist()) if not existing.empty else set()
-
-        rows = []
-        entries = fetch_feed_for_ticker(ticker)
-        for e in entries:
-            url = getattr(e, "link", "") or ""
-            if not url:
-                continue
-            if url in existing_urls:
-                logger.debug(f"{ticker}: skipping existing URL {url}")
-                continue
-            try:
-                row = extract_article_row(ticker, e)
-                rows.append(row)
-            except Exception:
-                logger.exception(f"{ticker}: error extracting article; skipping")
-        time.sleep(PER_TICKER_SLEEP)
-
-        if rows:
-            df_new = pd.DataFrame(rows)
-            df = pd.concat([df_new, existing], ignore_index=True).drop_duplicates(subset=["URL"])
-        else:
-            df = existing
-
-        for c in CSV_COLUMNS:
-            if c not in df.columns:
-                df[c] = ""
-        df = df[CSV_COLUMNS]
-        fname = CSV_TEMPLATE.format(ticker=ticker)
-        df.to_csv(fname, index=False)
-        logger.info(f"Wrote {len(df)} rows to {fname}")
-
-    logger.info("Script end")
-
-if __name__ == "__main__":
-    main()
