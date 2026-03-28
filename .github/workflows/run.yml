@@ -23,17 +23,29 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Show workspace debug
+        run: |
+          echo "PWD: $(pwd)"
+          ls -la
+
       - name: Run script
-        env:
-          HF_API_KEY: ${{ secrets.HF_API_KEY }}
         run: python script.py
 
-      - name: Commit updated CSV (safe)
+      - name: Show CSV contents debug
+        run: |
+          if [ -f news_data.csv ]; then
+            echo "news_data.csv head:"
+            head -n 20 news_data.csv || true
+            echo "lines:"
+            wc -l news_data.csv || true
+          else
+            echo "news_data.csv not found"
+          fi
+
+      - name: Commit updated CSV safe
         run: |
           git config --global user.name "bot"
           git config --global user.email "bot@github.com"
-
-          # Only add and commit if the file exists and there are changes
           if [ -f news_data.csv ]; then
             git add news_data.csv
             if ! git diff --cached --quiet; then
