@@ -3,7 +3,7 @@ from typing import Tuple, Dict, Any
 import requests
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_MODEL = "gemini-1.5-flash"  # change if needed
+GEMINI_MODEL = "gemini-2.5-pro"  # change if needed
 GEMINI_ENDPOINT_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
 GEMINI_RETRIES = 3
 GEMINI_BACKOFF_BASE = 1.5
